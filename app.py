@@ -116,7 +116,7 @@ def clean_date(val):
     except:
         return res
 
-# 3. YIKICI OLMAYAN ANA EXCEL SENKRONİZASYONU
+# 3. YIKICI OLMAYAN ANA EXCEL SENKRONİZASYONU (YÜKSEK HIZLI VERSİYON)
 def sync_excel_without_losing_dofs(uploaded_file):
     db = SessionLocal()
     try:
@@ -166,8 +166,9 @@ def sync_excel_without_losing_dofs(uploaded_file):
                     is_buyuk_proje=is_buyuk
                 )
                 db.add(project)
-                db.commit()
-                db.refresh(project)
+                # OPTİMİZASYON 1: commit() yerine flush() kullanıyoruz. 
+                # Diske yazmayı erteler ama bize o projenin ID'sini anında verir.
+                db.flush() 
                 yeni_p += 1
             else:
                 project.proje_adi = padi
@@ -181,8 +182,8 @@ def sync_excel_without_losing_dofs(uploaded_file):
                 project.notlar = pnot
                 project.per_sayisi = per_sayi
                 project.is_buyuk_proje = is_buyuk
-                db.commit()
                 guncel_p += 1
+                # OPTİMİZASYON 2: Buradaki döngü içi db.commit()'i sildik.
             
             audits_to_check = [
                 ('1. Denetim', 'DENETİM TARİHİ', 'DEN PUAN', 'DENETİM GÖREVLİSİ'),
@@ -223,15 +224,18 @@ def sync_excel_without_losing_dofs(uploaded_file):
                         mevcut.tarih = tarih_val if tarih_val else mevcut.tarih
                         mevcut.puan = puan_val
                         mevcut.gorevlisi = gor_val
-                        db.commit()
+                        # OPTİMİZASYON 3: Buradaki döngü içi db.commit()'i sildik.
                     
             if idx % 50 == 0:
                 progress_bar.progress(min(int((idx / total_rows) * 100), 100))
                 
+        # OPTİMİZASYON 4: Bütün Excel okunduktan sonra veritabanına TEK BİR ağ isteği atarak hepsini topluca kaydediyoruz.
         db.commit()
         progress_bar.progress(100)
         return total_rows, yeni_p, guncel_p, yeni_d
     except Exception as e:
+        # Hata anında yarım kalan işlemleri temizle
+        db.rollback() 
         st.error(f"Senkronizasyon Hatası: {e}")
         return 0, 0, 0, 0
     finally:
