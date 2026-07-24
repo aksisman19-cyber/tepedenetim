@@ -5,29 +5,27 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime, date, timedelta
 import io
 import re
-import plotly.express as px # YENİ: Profesyonel grafikler için eklendi
+import plotly.express as px
+import time
 
 # 1. SAYFA YAPILANDIRMASI
 st.set_page_config(
-    page_title="Tepe Servis | Kurumsal Denetim & Harita Platformu", 
+    page_title="Tepe Servis | Kurumsal Denetim & Harita Platformu V5", 
     page_icon="🗺️", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # 2. VERİTABANI VE GELİŞMİŞ MODELLER
-# Veritabanı URL'sini Streamlit Secrets (Gizli Değişkenler) içinden güvenli bir şekilde çekiyoruz
 try:
     db_url = st.secrets["DB_URL"]
 except:
     st.error("⚠️ Veritabanı bağlantı adresi (DB_URL) bulunamadı. Lütfen Streamlit Secrets ayarlarını kontrol edin.")
     st.stop()
 
-# SQLAlchemy bazı durumlarda 'postgres://' yerine 'postgresql://' formatını zorunlu kılar, bunu garantiye alıyoruz
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# PostgreSQL için check_same_thread parametresine gerek yoktur
 engine = create_engine(db_url)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -116,7 +114,7 @@ def clean_date(val):
     except:
         return res
 
-# 3. YIKICI OLMAYAN ANA EXCEL SENKRONİZASYONU (YÜKSEK HIZLI VERSİYON)
+# 3. YIKICI OLMAYAN ANA EXCEL SENKRONİZASYONU (BELLEK İÇİ EŞLEŞTİRME OPTİMİZASYONU)
 def sync_excel_without_losing_dofs(uploaded_file):
     db = SessionLocal()
     try:
@@ -128,6 +126,12 @@ def sync_excel_without_losing_dofs(uploaded_file):
         yeni_p = 0
         guncel_p = 0
         yeni_d = 0
+        
+        tum_projeler = db.query(ProjectDB).all()
+        proje_map = {p.proje_kodu: p for p in tum_projeler}
+        
+        tum_denetimler = db.query(AuditDB).all()
+        denetim_map = {(a.project_id, a.denetim_turu): a for a in tum_denetimler}
         
         for idx, row in df.iterrows():
             pkodu = clean_val(row.get('PROJE KODU'), default=f"KODSUZ-{idx}")
@@ -146,7 +150,8 @@ def sync_excel_without_losing_dofs(uploaded_file):
             if per_sayi >= 30:
                 is_buyuk = True
 
-            project = db.query(ProjectDB).filter(ProjectDB.proje_kodu == pkodu).first()
+            project = proje_map.get(pkodu)
+            
             if not project:
                 project = ProjectDB(
                     proje_kodu=pkodu,
@@ -166,9 +171,8 @@ def sync_excel_without_losing_dofs(uploaded_file):
                     is_buyuk_proje=is_buyuk
                 )
                 db.add(project)
-                # OPTİMİZASYON 1: commit() yerine flush() kullanıyoruz. 
-                # Diske yazmayı erteler ama bize o projenin ID'sini anında verir.
                 db.flush() 
+                proje_map[pkodu] = project 
                 yeni_p += 1
             else:
                 project.proje_adi = padi
@@ -183,7 +187,6 @@ def sync_excel_without_losing_dofs(uploaded_file):
                 project.per_sayisi = per_sayi
                 project.is_buyuk_proje = is_buyuk
                 guncel_p += 1
-                # OPTİMİZASYON 2: Buradaki döngü içi db.commit()'i sildik.
             
             audits_to_check = [
                 ('1. Denetim', 'DENETİM TARİHİ', 'DEN PUAN', 'DENETİM GÖREVLİSİ'),
@@ -194,21 +197,22 @@ def sync_excel_without_losing_dofs(uploaded_file):
             
             for tur, tar_col, puan_col, gor_col in audits_to_check:
                 tarih_val = clean_date(row.get(tar_col))
-                puan_val = None
                 
+                # VİRGÜLLÜ PUAN DÜZELTME KODU
+                puan_val = None
                 try:
-                    if pd.notnull(row.get(puan_col)):
-                        puan_val = float(row.get(puan_col))
+                    raw_p = row.get(puan_col)
+                    if pd.notnull(raw_p):
+                        if isinstance(raw_p, str):
+                            raw_p = raw_p.strip().replace(',', '.')
+                        puan_val = float(raw_p)
                 except:
                     puan_val = None
                 
                 gor_val = clean_val(row.get(gor_col)) if gor_col else clean_val(row.get('DENETİM GÖREVLİSİ'))
                 
                 if puan_val is not None or tarih_val is not None:
-                    mevcut = db.query(AuditDB).filter(
-                        AuditDB.project_id == project.id,
-                        AuditDB.denetim_turu == tur
-                    ).first()
+                    mevcut = denetim_map.get((project.id, tur))
                     
                     if not mevcut:
                         audit = AuditDB(
@@ -219,23 +223,21 @@ def sync_excel_without_losing_dofs(uploaded_file):
                             gorevlisi=gor_val
                         )
                         db.add(audit)
+                        denetim_map[(project.id, tur)] = audit
                         yeni_d += 1
                     else:
                         mevcut.tarih = tarih_val if tarih_val else mevcut.tarih
                         mevcut.puan = puan_val
                         mevcut.gorevlisi = gor_val
-                        # OPTİMİZASYON 3: Buradaki döngü içi db.commit()'i sildik.
                     
             if idx % 50 == 0:
                 progress_bar.progress(min(int((idx / total_rows) * 100), 100))
                 
-        # OPTİMİZASYON 4: Bütün Excel okunduktan sonra veritabanına TEK BİR ağ isteği atarak hepsini topluca kaydediyoruz.
         db.commit()
         progress_bar.progress(100)
         return total_rows, yeni_p, guncel_p, yeni_d
     except Exception as e:
-        # Hata anında yarım kalan işlemleri temizle
-        db.rollback() 
+        db.rollback()
         st.error(f"Senkronizasyon Hatası: {e}")
         return 0, 0, 0, 0
     finally:
@@ -252,19 +254,24 @@ def sync_coordinates(uploaded_file):
         if not pk_col or not koor_col:
             return False, "Excel dosyanızda 'PROJE KODU' ve 'KOORDİNAT' sütunları bulunamadı. Lütfen başlıkları kontrol edin."
             
+        tum_projeler = db.query(ProjectDB).all()
+        proje_map = {p.proje_kodu: p for p in tum_projeler}
+        
         count = 0
         for idx, row in df.iterrows():
             pk = str(row[pk_col]).strip()
             coord = str(row[koor_col]).strip() if pd.notnull(row[koor_col]) else None
             
             if pk and coord and coord.lower() != "nan":
-                proj = db.query(ProjectDB).filter(ProjectDB.proje_kodu == pk).first()
+                proj = proje_map.get(pk)
                 if proj:
                     proj.koordinat = coord
                     count += 1
+                    
         db.commit()
         return True, count
     except Exception as e:
+        db.rollback()
         return False, str(e)
     finally:
         db.close()
@@ -272,8 +279,8 @@ def sync_coordinates(uploaded_file):
 # 5. YAN MENÜ (SIDEBAR)
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2912/2912773.png", width=60)
-    st.title("Tepe Servis Denetim")
-    st.caption("Denetim Paneli")
+    st.title("Tepe Denetim V5")
+    st.caption("Harita Destekli Denetim Paneli")
     st.markdown("---")
     sayfa = st.radio(
         "🗂️ Modül Seçin",
@@ -403,7 +410,8 @@ elif sayfa == "🚨 Akıllı Ziyaret Radarı & Alarmlar":
     st.header("🚨 Akıllı Denetim Frekans Radarı")
     if all_projects:
         today = date.today()
-        eski_gizle = st.checkbox("✅ 2024-2025 Yıllarından Kalan Eski Projeleri Gizle", value=True)
+        # RADAR FİLTRESİ KAPATILDI
+        eski_gizle = st.checkbox("✅ 2024-2025 Yıllarından Kalan Eski Projeleri Gizle", value=False)
         muaf_durumlar = ["DENETİM DIŞI", "KAPANDI", "BİTTİ", "İLAÇLAMA", "İSTENMEDİ"]
         
         alarm_listesi = []
@@ -610,7 +618,6 @@ elif sayfa == "🎯 Proje Detay, DÖF & 🗺️ Harita":
                             key=f"d_{doc.id}"
                         )
 
-            # YENİ: PROFESYONEL GRAFİK (Plotly)
             with p_tab3:
                 st.subheader("📈 Denetim Puanı Trendi")
                 puanli = [a for a in p.audits if a.puan is not None]
@@ -692,8 +699,6 @@ elif sayfa == "🛠️ DÖF Takip & Kök Neden Analizi":
                 })
             
             df_edit = pd.DataFrame(dof_listesi)
-            
-            # String olarak gelen veriyi Date formatına çeviriyoruz.
             df_edit["Termin Tarihi"] = pd.to_datetime(df_edit["Termin Tarihi"], errors='coerce').dt.date
             
             edited_df = st.data_editor(
@@ -720,7 +725,6 @@ elif sayfa == "🛠️ DÖF Takip & Kök Neden Analizi":
                     dof_id = row["DB_ID"]
                     guncel_durum = row["Durum"]
                     
-                    # Veritabanına kaydederken Date objesini tekrar String'e çeviriyoruz.
                     if pd.notnull(row["Termin Tarihi"]):
                         guncel_termin = row["Termin Tarihi"].strftime("%Y-%m-%d")
                     else:
@@ -745,12 +749,13 @@ elif sayfa == "🛠️ DÖF Takip & Kök Neden Analizi":
                 if degisen_sayisi > 0:
                     db.commit()
                     st.success(f"✅ {degisen_sayisi} adet DÖF başarıyla güncellendi!")
+                    time.sleep(1)
                     st.rerun()
                 else:
                     st.info("Herhangi bir değişiklik yapılmadı.")
 
 # ==========================================
-# SAYFA 6: DENETİM, ZİYARET VE DÖF GİRİŞİ (YENİ)
+# SAYFA 6: DENETİM, ZİYARET VE DÖF GİRİŞİ 
 # ==========================================
 elif sayfa == "➕ Denetim & Ziyaret Girişi":
     st.header("➕ Yeni Denetim, Ziyaret ve DÖF Girişi")
@@ -760,7 +765,6 @@ elif sayfa == "➕ Denetim & Ziyaret Girişi":
     else:
         tab_denetim, tab_dof = st.tabs(["📝 Yeni Denetim / Ziyaret Formu", "🚨 Yeni DÖF (Uygunsuzluk) Formu"])
         
-        # --- ZİYARET / DENETİM FORMU ---
         with tab_denetim:
             with st.form("form_denetim", clear_on_submit=True):
                 st.subheader("Yeni Ziyaret / Denetim Kaydı Oluştur")
@@ -792,8 +796,9 @@ elif sayfa == "➕ Denetim & Ziyaret Girişi":
                     db.add(yeni_denetim)
                     db.commit()
                     st.success(f"✅ '{d_tur}' kaydı {secili_p.proje_adi} projesi için başarıyla eklendi!")
+                    time.sleep(1)
+                    st.rerun()
 
-        # --- DÖF AÇMA FORMU ---
         with tab_dof:
             with st.form("form_dof", clear_on_submit=True):
                 st.subheader("Yeni DÖF (Düzenleyici ve Önleyici Faaliyet) Aç")
@@ -833,6 +838,8 @@ elif sayfa == "➕ Denetim & Ziyaret Girişi":
                         db.add(yeni_dof)
                         db.commit()
                         st.success(f"✅ {dof_no} numaralı DÖF başarıyla açıldı!")
+                        time.sleep(1)
+                        st.rerun()
 
 # ==========================================
 # SAYFA 7: DENETÇİ KARNESİ
@@ -896,7 +903,7 @@ elif sayfa == "🔄 Excel & Koordinat Yükleme":
             st.info("Ana projeleri, personelleri ve denetim puanlarını güncellemek için kullanılır. (DÖF'ler silinmez).")
             up_f = st.file_uploader("📂 Ana Excel Dosyasını Buraya Bırakın", type=["xlsx", "xls"], key="ana_excel")
             if up_f and st.button("🔄 Sistemi Senkronize Et", type="primary", key="btn_ana"):
-                with st.spinner("İşleniyor..."):
+                with st.spinner("Veriler RAM üzerinden eşleştiriliyor, lütfen bekleyin..."):
                     tr, yp, gp, yd = sync_excel_without_losing_dofs(up_f)
                     st.success(f"🎉 Tamamlandı! Yeni Proje: {yp}, Güncellenen: {gp}.")
                     
@@ -904,7 +911,7 @@ elif sayfa == "🔄 Excel & Koordinat Yükleme":
             st.success("🗺️ **Harita Entegrasyonu:** İçinde 'PROJE KODU' ve 'KOORDİNAT' sütunları olan 2. Excel dosyanızı yükleyin.")
             up_k = st.file_uploader("📍 Koordinat Excel Dosyasını Buraya Bırakın", type=["xlsx", "xls"], key="koor_excel")
             if up_k and st.button("🚀 Koordinatları Sisteme Göm", type="primary", key="btn_koor"):
-                with st.spinner("Haritalar oluşturuluyor..."):
+                with st.spinner("Haritalar RAM üzerinden oluşturuluyor..."):
                     basari, mesaj = sync_coordinates(up_k)
                     if basari:
                         st.success(f"🎉 Harika! Toplam {mesaj} projenin koordinatı başarıyla sisteme gömüldü ve haritaları oluşturuldu!")
