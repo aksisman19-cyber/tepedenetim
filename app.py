@@ -26,7 +26,8 @@ except:
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(db_url)
+# BULUT VERİTABANI KOPMALARINI ENGELLEYEN YENİ MOTOR AYARI
+engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -93,13 +94,6 @@ class DocumentDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        return db
-    finally:
-        db.close()
-
 def clean_val(val, default=""):
     if pd.isnull(val) or str(val).strip() in ['NaT', 'nan', '?', 'None', '']:
         return default
@@ -114,7 +108,7 @@ def clean_date(val):
     except:
         return res
 
-# 3. YIKICI OLMAYAN ANA EXCEL SENKRONİZASYONU (BELLEK İÇİ EŞLEŞTİRME OPTİMİZASYONU)
+# 3. YIKICI OLMAYAN ANA EXCEL SENKRONİZASYONU (BELLEK İÇİ EŞLEŞTİRME OPTİMİZASYONU EKLENDİ)
 def sync_excel_without_losing_dofs(uploaded_file):
     db = SessionLocal()
     try:
@@ -198,7 +192,7 @@ def sync_excel_without_losing_dofs(uploaded_file):
             for tur, tar_col, puan_col, gor_col in audits_to_check:
                 tarih_val = clean_date(row.get(tar_col))
                 
-                # VİRGÜLLÜ PUAN DÜZELTME KODU
+                # VİRGÜLLÜ PUAN DÜZELTME KODU (Virgülü noktaya çevirir, None hatalarını önler)
                 puan_val = None
                 try:
                     raw_p = row.get(puan_col)
@@ -296,7 +290,8 @@ with st.sidebar:
         ]
     )
 
-db = get_db()
+# VERİTABANI BAĞLANTISI (get_db KAPATILDI, ERKEN KAPANMA SORUNU ÇÖZÜLDÜ)
+db = SessionLocal()
 all_projects = db.query(ProjectDB).all()
 all_audits = db.query(AuditDB).all()
 all_dofs = db.query(DofDB).all()
@@ -410,7 +405,7 @@ elif sayfa == "🚨 Akıllı Ziyaret Radarı & Alarmlar":
     st.header("🚨 Akıllı Denetim Frekans Radarı")
     if all_projects:
         today = date.today()
-        # RADAR FİLTRESİ KAPATILDI
+        # RADAR FİLTRESİ DÜZELTİLDİ
         eski_gizle = st.checkbox("✅ 2024-2025 Yıllarından Kalan Eski Projeleri Gizle", value=False)
         muaf_durumlar = ["DENETİM DIŞI", "KAPANDI", "BİTTİ", "İLAÇLAMA", "İSTENMEDİ"]
         
@@ -607,6 +602,7 @@ elif sayfa == "🎯 Proje Detay, DÖF & 🗺️ Harita":
                         db.add(yeni_doc)
                         db.commit()
                         st.success("Yüklendi!")
+                        time.sleep(1)
                         st.rerun()
                         
                 if p.documents:
